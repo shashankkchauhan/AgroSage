@@ -29,6 +29,7 @@ if str(ROOT) not in sys.path:
 # ── local imports ────────────────────────────────────────────────────────────
 from backend.agents.orchestrator import AgentOrchestrator
 from backend.services.llm_evaluator import LLMEvaluator, RequestRecord, EvalMetrics
+from backend.services.granite_service import get_token_tracker
 
 # ─────────────────────── page config ─────────────────────────────────────────
 
@@ -162,7 +163,7 @@ with st.sidebar:
 
     page = st.radio(
         "Navigation",
-        ["💬 Farmer Chatbot", "📊 LLM Evaluation Dashboard", "🛡️ Guardrails Monitor"],
+        ["💬 Farmer Chatbot", "📊 LLM Evaluation Dashboard", "🛡️ Guardrails Monitor", "🪙 Token Usage"],
         label_visibility="collapsed",
     )
 
@@ -827,6 +828,157 @@ elif page == "🛡️ Guardrails Monitor":
                 st.warning("⚠️ Requires expert: " + "; ".join(ag_result.warnings[:2]))
             else:
                 st.success("✅ Safe agricultural query")
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  PAGE 4: TOKEN USAGE
+# ═════════════════════════════════════════════════════════════════════════════
+
+elif page == "🪙 Token Usage":
+    st.title("🪙 IBM Granite — Token Usage Dashboard")
+    st.caption("Live token consumption tracking for every IBM Granite / watsonx.ai call in this session.")
+
+    tracker = get_token_tracker()
+    summary = tracker.summary()
+
+    # ── top KPIs (matching the watsonx.ai dashboard style) ───────────────────
+    st.subheader("Session Token Summary")
+
+    k1, k2, k3, k4, k5 = st.columns(5)
+
+    # Big counter — styled like the watsonx screenshot
+    k1.markdown(f"""
+    <div style="background:white;border:1px solid #e0e8d8;border-radius:10px;padding:20px;text-align:center">
+      <div style="font-size:13px;color:#666;text-transform:uppercase;letter-spacing:1px">Total Tokens Used</div>
+      <div style="font-size:48px;font-weight:800;color:#1a3a1a;line-height:1.1">{summary['total_tokens']:,}</div>
+      <div style="font-size:12px;color:#2d7a2d">▲ This Session</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    k2.metric("📥 Input Tokens",   f"{summary['total_input_tokens']:,}")
+    k3.metric("📤 Output Tokens",  f"{summary['total_output_tokens']:,}")
+    k4.metric("🔁 Total Requests", summary['total_requests'])
+    k5.metric("💰 Est. Cost (USD)", f"${summary['total_cost_usd']:.6f}")
+
+    st.divider()
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        # ── token breakdown donut ─────────────────────────────────────────────
+        st.subheader("Token Breakdown")
+        if summary['total_tokens'] > 0:
+            fig_donut = go.Figure(go.Pie(
+                labels=["Input Tokens", "Output Tokens"],
+                values=[summary['total_input_tokens'], summary['total_output_tokens']],
+                hole=0.60,
+                marker_colors=["#1b5e20", "#81c784"],
+                textinfo="label+percent",
+            ))
+            fig_donut.update_layout(
+                template="plotly_white", height=320,
+                annotations=[dict(
+                    text=f"<b>{summary['total_tokens']:,}</b><br>Total",
+                    x=0.5, y=0.5, font_size=16, showarrow=False
+                )],
+            )
+            st.plotly_chart(fig_donut, use_container_width=True)
+        else:
+            st.info("No token data yet — ask a question in the Chatbot tab first.")
+
+    with col2:
+        # ── token usage per request bar ───────────────────────────────────────
+        st.subheader("Tokens Per Request")
+        calls = summary.get("calls", [])
+        if calls:
+            df_calls = pd.DataFrame(calls)
+            fig_bar = go.Figure()
+            fig_bar.add_trace(go.Bar(
+                name="Input Tokens",
+                x=[f"#{c['request_num']}" for c in calls],
+                y=[c["input_tokens"] for c in calls],
+                marker_color="#1b5e20",
+            ))
+            fig_bar.add_trace(go.Bar(
+                name="Output Tokens",
+                x=[f"#{c['request_num']}" for c in calls],
+                y=[c["output_tokens"] for c in calls],
+                marker_color="#81c784",
+            ))
+            fig_bar.update_layout(
+                barmode="stack",
+                template="plotly_white",
+                height=320,
+                xaxis_title="Request",
+                yaxis_title="Tokens",
+            )
+            st.plotly_chart(fig_bar, use_container_width=True)
+        else:
+            st.info("No requests yet.")
+
+    # ── cumulative token usage line chart ─────────────────────────────────────
+    st.subheader("Cumulative Token Usage Over Time")
+    if calls:
+        cumulative = 0
+        cum_data = []
+        for c in calls:
+            cumulative += c["total_tokens"]
+            cum_data.append({"Request": f"#{c['request_num']}", "Cumulative Tokens": cumulative,
+                             "Time": c["timestamp"]})
+        df_cum = pd.DataFrame(cum_data)
+        fig_line = px.line(
+            df_cum, x="Request", y="Cumulative Tokens",
+            title="Cumulative Tokens Used",
+            markers=True,
+            color_discrete_sequence=["#2d7a2d"],
+            template="plotly_white",
+            height=300,
+        )
+        fig_line.update_traces(line_width=2.5, marker_size=8)
+        st.plotly_chart(fig_line, use_container_width=True)
+
+    # ── per-call detail table ─────────────────────────────────────────────────
+    st.subheader("Per-Call Detail")
+    if calls:
+        df_detail = pd.DataFrame(calls)[
+            ["request_num", "timestamp", "model_id", "input_tokens", "output_tokens",
+             "total_tokens", "latency_ms", "cost_usd"]
+        ].rename(columns={
+            "request_num":   "Req #",
+            "timestamp":     "Time",
+            "model_id":      "Model",
+            "input_tokens":  "Input Tokens",
+            "output_tokens": "Output Tokens",
+            "total_tokens":  "Total Tokens",
+            "latency_ms":    "Latency (ms)",
+            "cost_usd":      "Cost (USD)",
+        })
+        st.dataframe(df_detail, use_container_width=True, hide_index=True)
+    else:
+        st.info("Ask a question in the Chatbot to populate this table.")
+
+    # ── pricing reference ─────────────────────────────────────────────────────
+    st.divider()
+    st.subheader("💡 IBM watsonx.ai Token Pricing Reference")
+    st.markdown("""
+    | Model | Input (per 1M tokens) | Output (per 1M tokens) | Free Tier |
+    |---|---|---|---|
+    | `ibm/granite-4-h-small` | $0.60 | $2.40 | ✅ Included in Lite |
+    | `ibm/granite-3-1-8b-base` | $0.60 | $2.40 | ✅ Included in Lite |
+    | `meta-llama/llama-3-3-70b-instruct` | $0.90 | $2.90 | ✅ Included in Lite |
+
+    > 📊 **To see your actual official usage:** Go to [dataplatform.cloud.ibm.com](https://dataplatform.cloud.ibm.com) → Your Project → **Manage** tab → **Resource Usage** section (as shown in your screenshot).
+    """)
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        st.metric("Avg Tokens per Request", summary['avg_tokens_per_req'])
+    with col_b:
+        remaining_free = max(0, 50_000 - summary['total_tokens'])
+        st.metric("Est. Free Tokens Remaining (Lite)", f"{remaining_free:,}")
+
+    if st.button("🔄 Refresh Token Data"):
+        st.rerun()
+
 
 # ── footer ───────────────────────────────────────────────────────────────────
 st.markdown("""

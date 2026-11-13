@@ -30,6 +30,63 @@ class GraniteResponse:
     error: Optional[str]   = None
 
 
+# ─────────────────────── session token tracker ───────────────────────────────
+
+class TokenUsageTracker:
+    """Accumulates token usage across all calls in a session."""
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self.total_input_tokens:  int   = 0
+        self.total_output_tokens: int   = 0
+        self.total_requests:      int   = 0
+        self.total_cost_usd:      float = 0.0
+        self.calls: List[Dict[str, Any]] = []
+
+    def record(self, input_tok: int, output_tok: int,
+               latency_ms: float, model_id: str) -> None:
+        # Approximate pricing (illustrative — watsonx.ai Lite is free up to limits)
+        cost = (input_tok / 1_000_000 * 0.60) + (output_tok / 1_000_000 * 2.40)
+        self.total_input_tokens  += input_tok
+        self.total_output_tokens += output_tok
+        self.total_requests      += 1
+        self.total_cost_usd      += cost
+        self.calls.append({
+            "request_num":    self.total_requests,
+            "input_tokens":   input_tok,
+            "output_tokens":  output_tok,
+            "total_tokens":   input_tok + output_tok,
+            "latency_ms":     latency_ms,
+            "cost_usd":       round(cost, 8),
+            "model_id":       model_id,
+            "timestamp":      time.strftime("%H:%M:%S"),
+        })
+
+    def summary(self) -> Dict[str, Any]:
+        return {
+            "total_input_tokens":  self.total_input_tokens,
+            "total_output_tokens": self.total_output_tokens,
+            "total_tokens":        self.total_input_tokens + self.total_output_tokens,
+            "total_requests":      self.total_requests,
+            "total_cost_usd":      round(self.total_cost_usd, 6),
+            "avg_tokens_per_req":  round(
+                (self.total_input_tokens + self.total_output_tokens)
+                / max(self.total_requests, 1), 1
+            ),
+            "calls": self.calls[-50:],   # last 50
+        }
+
+
+# Singleton tracker shared across the app session
+_token_tracker = TokenUsageTracker()
+
+
+def get_token_tracker() -> TokenUsageTracker:
+    return _token_tracker
+
+
 # ─────────────────────── service ─────────────────────────────────────────────
 
 class GraniteService:
@@ -93,18 +150,29 @@ class GraniteService:
             return self._mock_response(user_prompt, t0)
 
         try:
-            result = self._model.generate_text(prompt=full_prompt)
+            # Use generate (returns full dict with token counts)
+            raw = self._model.generate(prompt=full_prompt)
             elapsed = (time.perf_counter() - t0) * 1000
 
-            # watsonx.ai returns different shapes; normalise
-            if isinstance(result, dict):
-                text = result.get("results", [{}])[0].get("generated_text", str(result))
-                usage = result.get("results", [{}])[0]
-                input_tok  = usage.get("input_token_count", 0)
-                output_tok = usage.get("generated_token_count", 0)
+            # Normalise watsonx.ai response shape
+            if isinstance(raw, dict):
+                res_block  = raw.get("results", [{}])[0]
+                text       = res_block.get("generated_text", "")
+                input_tok  = res_block.get("input_token_count", 0)
+                output_tok = res_block.get("generated_token_count", 0)
             else:
-                text = str(result)
-                input_tok = output_tok = 0
+                # Plain string fallback — estimate from word count
+                text       = str(raw)
+                input_tok  = len(full_prompt.split())
+                output_tok = len(text.split())
+
+            # Fallback estimation if API returns 0
+            if input_tok == 0:
+                input_tok = max(1, len(full_prompt.split()) * 4 // 3)
+            if output_tok == 0:
+                output_tok = max(1, len(text.split()) * 4 // 3)
+
+            _token_tracker.record(input_tok, output_tok, round(elapsed, 2), self.model_id)
 
             return GraniteResponse(
                 text=text.strip(),
@@ -112,7 +180,7 @@ class GraniteService:
                 input_tokens=input_tok,
                 output_tokens=output_tok,
                 latency_ms=round(elapsed, 2),
-                ttft_ms=round(elapsed * 0.3, 2),   # estimate
+                ttft_ms=round(elapsed * 0.3, 2),
             )
         except Exception as exc:
             logger.error(f"Granite generation error: {exc}")
@@ -142,11 +210,14 @@ class GraniteService:
         query_lower = query.lower()
         answer = next((v for k, v in mock_answers.items() if k in query_lower),
                       "I can help you with crop recommendations, soil management, pest control, weather information, and market prices. Please describe your agricultural query in detail.")
+        in_tok  = max(1, len(query.split()) * 4 // 3)
+        out_tok = max(1, len(answer.split()) * 4 // 3)
+        _token_tracker.record(in_tok, out_tok, round(elapsed + 50, 2), f"{self.model_id}-MOCK")
         return GraniteResponse(
             text=answer,
             model_id=f"{self.model_id}-MOCK",
-            input_tokens=len(query.split()),
-            output_tokens=len(answer.split()),
+            input_tokens=in_tok,
+            output_tokens=out_tok,
             latency_ms=round(elapsed + 50, 2),
             ttft_ms=15.0,
             is_mock=True,
